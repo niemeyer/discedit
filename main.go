@@ -303,6 +303,7 @@ func (f *Forum) UpdateTopic(topic *Topic, source *os.File) error {
 	data, err := json.Marshal(map[string]interface{}{
 		"post": map[string]interface{}{
 			"raw": string(content),
+			"raw_old": topic.Post.Raw,
 		},
 	})
 	body := bytes.NewReader(data)
@@ -342,7 +343,7 @@ func (f *Forum) UpdateTopic(topic *Topic, source *os.File) error {
 			}
 		}
 
-		return fmt.Errorf("cannot perform update (saved at %s): %s", source.Name(), msg)
+		return fmt.Errorf("cannot perform update: %s", msg)
 	}
 
 	log.Printf("Update of %s successful.", topic)
