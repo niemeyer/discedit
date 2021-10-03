@@ -5,19 +5,26 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
+)
+
+var (
+	debug = flag.Bool("debug", false, "Debug mode")
+
+	ignoreDraft = flag.Bool("ignore-draft", false, "Ignore existing draft and start over")
+	forceDraft  = flag.Bool("force-draft", false, "Open draft even if it has conflicts")
+	liveEdit    = flag.Bool("live-edit", false, "Update post while content is being edited")
 )
 
 type Config struct {
@@ -31,8 +38,8 @@ type ForumConfig struct {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: discedit <forum topic URL>\n")
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Usage: discedit <forum topic URL>\n\nOptions:\n\n")
+		flag.PrintDefaults()
 	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -88,6 +95,7 @@ func run() error {
 
 	if len(args) != 1 {
 		flag.Usage()
+		os.Exit(1)
 	}
 
 	config, err := readConfig()
@@ -105,30 +113,62 @@ func run() error {
 		return fmt.Errorf("~/.discedit misses username and key for forum %s", baseURL)
 	}
 
-	forum := Forum{
+	forum := &Forum{
 		config:  fconfig,
 		baseURL: baseURL,
 	}
 
-	topic, err := forum.Topic(topicID)
+	topic, err := forum.LoadTopic(topicID)
 	if err != nil {
 		return err
 	}
 
-	edited, different, err := edit(topic)
-	if different || err != nil {
-		defer renameToLast(edited)
+	if !*ignoreDraft {
+		err = forum.LoadDraft(topic)
+		if err != nil && !isNotFound(err) {
+			return err
+		}
+		err = topic.CheckDraft()
+		if err != nil {
+			if *forceDraft {
+				logf("Previous draft has problems: %s", err)
+				logf("Using draft anyway due to -force-draft")
+			} else {
+				return err
+			}
+		}
+	}
+
+	var initial = topic.OriginalText()
+
+	var different, empty bool
+	filename, err := edit(forum, topic)
+	if err == nil {
+		// Make sure to check OriginalText after editing, as changes
+		// made may have been previously saved via live editing.
+		different, empty, err = fileChanged(filename, topic.OriginalText())
+	}
+	if (different && !empty) || err != nil {
+		defer renameToLast(filename)
 	}
 	if err != nil {
 		return err
 	}
+	if empty {
+		os.Remove(filename)
+		return fmt.Errorf("no content provided, aborting")
+	}
 	if !different {
-		log.Printf("Content has not changed. Nothing to do.")
-		os.Remove(edited.Name())
+		if *liveEdit && initial != topic.OriginalText() {
+			logf("Changes already saved.")
+		} else {
+			logf("No changes to save.")
+		}
+		os.Remove(filename)
 		return nil
 	}
 
-	err = forum.UpdateTopic(topic, edited)
+	err = forum.SaveTopic(topic, filename)
 	if err != nil {
 		return err
 	}
@@ -136,28 +176,28 @@ func run() error {
 	return nil
 }
 
-const lastEditName = "~/.discedit.last.md"
-
-func renameToLast(edited *os.File) {
-	renameErr := os.Rename(edited.Name(), os.ExpandEnv("$HOME/.discedit.last.md"))
+func renameToLast(filename string) {
+	renameErr := os.Rename(filename, os.ExpandEnv("$HOME/.discedit.last.md"))
 	if renameErr != nil {
-		log.Printf("WARNING: Cannot save backup: %v", renameErr)
+		logf("WARNING: Cannot save backup: %v", renameErr)
 	} else {
-		log.Printf("Saved backup: %s", lastEditName)
+		logf("Saved backup: ~/.discedit.last.md")
 	}
 }
 
-func edit(t *Topic) (edited *os.File, different bool, err error) {
+func edit(forum *Forum, topic *Topic) (filename string, err error) {
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
 		editor = "sensible-editor"
 	}
 
-	log.Printf("Opening your preferred editor...")
+	logf("Opening your preferred editor...")
+
+	text := topic.EditText()
 
 	tmpfile, err := os.Create(fmt.Sprintf("%s/.discedit.%d.md", os.Getenv("HOME"), os.Getpid()))
 	if err == nil {
-		_, err = tmpfile.Write([]byte(t.Post.Raw))
+		_, err = tmpfile.Write([]byte(text))
 	}
 	if err == nil {
 		err = tmpfile.Close()
@@ -167,33 +207,85 @@ func edit(t *Topic) (edited *os.File, different bool, err error) {
 			tmpfile.Close()
 			os.Remove(tmpfile.Name())
 		}
-		return nil, false, fmt.Errorf("cannot write temporary file: %v", err)
+		return "", fmt.Errorf("cannot write temporary file: %v", err)
 	}
+	filename = tmpfile.Name()
 
-	cmd := exec.Command(editor, tmpfile.Name())
+	cmd := exec.Command(editor, filename)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	stat, err := os.Stat(filename)
+	if err != nil {
+		return "", fmt.Errorf("cannot stat temporary file: %v", err)
+	}
+	stop := make(chan bool)
+	done := make(chan bool)
+
+	go func() {
+		defer close(done)
+		last := false
+		for !last {
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-stop:
+				last = true
+			}
+
+			curstat, err := os.Stat(filename)
+			if err != nil {
+				debugf("Error stating file for draft: %v", err)
+				continue
+			}
+			if curstat.ModTime() == stat.ModTime() {
+				continue
+			}
+			different, empty, err := fileChanged(filename, text)
+			if err != nil || !different || empty {
+				continue
+			}
+			if *liveEdit {
+				err = forum.SaveTopic(topic, filename)
+				if err != nil {
+					debugf("Error saving live edit: %v", err)
+					// Try to save the draft at least.
+				}
+			}
+			if !*liveEdit || err != nil {
+				err = forum.SaveDraft(topic, filename)
+				if err != nil {
+					debugf("Error saving draft: %v", err)
+					continue
+				}
+			}
+			stat = curstat
+			text = topic.EditText()
+		}
+	}()
+
+	quietMode = true
 	err = cmd.Run()
+	quietMode = false
 	if err != nil {
-		return nil, false, fmt.Errorf("cannot edit file %s: %v", tmpfile.Name(), err)
+		return "", fmt.Errorf("cannot edit file %s: %v", filename, err)
 	}
 
-	tmpfile, err = os.Open(tmpfile.Name())
-	var data []byte
-	if err == nil {
-		data, err = ioutil.ReadAll(tmpfile)
-	}
-	if err == nil {
-		_, err = tmpfile.Seek(0, 0)
-	}
+	close(stop)
+	<-done
+
+	return filename, nil
+}
+
+func fileChanged(filename, original string) (different, empty bool, err error) {
+	data, err := ioutil.ReadFile(filename)
 	if err != nil {
-		return nil, false, fmt.Errorf("cannot tell whether %s changed: %v", tmpfile.Name(), err)
+		return false, false, fmt.Errorf("cannot tell whether %s changed: %v", filename, err)
 	}
-
-	different = strings.TrimSpace(string(data)) != strings.TrimSpace(t.Post.Raw)
-
-	return tmpfile, different, nil
+	trimmed := string(bytes.TrimSpace(data))
+	different = trimmed != strings.TrimSpace(original)
+	empty = len(trimmed) == 0
+	return different, empty, nil
 }
 
 func outputErr(output []byte, err error) error {
@@ -223,14 +315,38 @@ func parseTopicURL(topicURL string) (baseURL string, ID int, err error) {
 }
 
 type Topic struct {
-	ID       int       `json:"id"`
-	Slug     string    `json:"slug"`
-	Title    string    `json:"title"`
-	Category int       `json:"category_id"`
-	BumpedAt time.Time `json:"bumped_at"`
+	ID            int       `json:"id"`
+	Slug          string    `json:"slug"`
+	Title         string    `json:"title"`
+	Category      int       `json:"category_id"`
+	BumpedAt      time.Time `json:"bumped_at"`
+	DraftKey      string    `json:"draft_key"`
+	DraftSequence int       `json:"draft_sequence"`
 
 	Post    *Post
+	Draft   *Draft
 	content []byte
+}
+
+func (t *Topic) EditText() string {
+	if t.Draft != nil {
+		return t.Draft.EditText()
+	}
+	return t.Post.EditText()
+}
+
+func (t *Topic) OriginalText() string {
+	if t.Draft != nil {
+		return t.Draft.OriginalText()
+	}
+	return t.Post.OriginalText()
+}
+
+func (t *Topic) CheckDraft() error {
+	if t.Draft != nil && t.Draft.OriginalText() != t.Post.OriginalText() {
+		return fmt.Errorf("content was changed after existing draft started (see -ignore-draft and -force-draft)")
+	}
+	return nil
 }
 
 func (t *Topic) String() string {
@@ -256,58 +372,234 @@ func (t *Topic) Blurb() string {
 	return ""
 }
 
+type Draft struct {
+	Key      string     `json:"draft_key"`
+	TopicID  int        `json:"topic_id"`
+	Sequence int        `json:"sequence"`
+	Data     *DraftData `json:"data"`
+}
+
+func (d *Draft) EditText() string {
+	return d.Data.Reply
+}
+
+func (d *Draft) OriginalText() string {
+	return d.Data.OriginalText
+}
+
+type DraftData struct {
+	Action       string `json:"action"`
+	Title        string `json:"title"`
+	Reply        string `json:"reply"`
+	OriginalText string `json:"originalText"`
+	ComposerTime int    `json:"composerTime"`
+	TypingTime   int    `json:"typingTime"`
+	PostID       int    `json:"postId"`
+	Whisper      bool   `json:"whisper"`
+}
+
+type draftData DraftData
+
+func (dd *DraftData) MarshalJSON() ([]byte, error) {
+	raw, err := json.Marshal((*draftData)(dd))
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(string(raw))
+}
+
+func (dd *DraftData) UnmarshalJSON(data []byte) error {
+	var raw string
+	err := json.Unmarshal(data, &raw)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(raw), (*draftData)(dd))
+}
+
 type Post struct {
-	ID        int       `json:"id"`
-	Username  string    `json:"username"`
-	Cooked    string    `json:"cooked"`
-	Raw       string    `json:"raw"`
-	UpdatedAt time.Time `json:"updated_at"`
-	TopicID   int       `json:"topic_id"`
-	Blurb     string    `json:"blurb"`
+	ID            int       `json:"id"`
+	Username      string    `json:"username"`
+	Cooked        string    `json:"cooked"`
+	Raw           string    `json:"raw"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	TopicID       int       `json:"topic_id"`
+	Blurb         string    `json:"blurb"`
+	DraftSequence int       `json:"draft_sequence"`
+}
+
+func (p *Post) EditText() string {
+	return p.Raw
+}
+
+func (p *Post) OriginalText() string {
+	return p.Raw
 }
 
 type Forum struct {
 	config  *ForumConfig
 	baseURL string
-	cache   map[int]*topicCache
-	mu      sync.Mutex
-}
-
-type topicCache struct {
-	mu    sync.Mutex
-	time  time.Time
-	topic *Topic
-}
-
-const topicCacheTimeout = 1 * time.Hour
-const topicCacheFallback = 7 * 24 * time.Hour
-
-func (f *Forum) ResetCache(topic *Topic) {
-	f.mu.Lock()
-	delete(f.cache, topic.ID)
-	f.mu.Unlock()
 }
 
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 }
 
-func (f *Forum) UpdateTopic(topic *Topic, source *os.File) error {
-	content, err := ioutil.ReadAll(source)
-	if err != nil {
-		return fmt.Errorf("cannot read edited content at %s: %v", source.Name(), err)
+func (f *Forum) LoadTopic(topicID int) (topic *Topic, err error) {
+
+	logf("Loading topic %d...", topicID)
+
+	var result struct {
+		*Topic
+		PostStream struct {
+			Posts []*Post
+		} `json:"post_stream"`
 	}
 
-	log.Printf("Updating topic %s ...", topic)
+	err = f.do("GET", "/t/"+strconv.Itoa(topicID)+".json?include_raw=true", nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	if result.Topic == nil || len(result.PostStream.Posts) == 0 {
+		return nil, fmt.Errorf("internal error: topic %d has no posts!?", topicID)
+	}
 
-	data, err := json.Marshal(map[string]interface{}{
+	result.Topic.Post = result.PostStream.Posts[0]
+	return result.Topic, nil
+}
+
+func (f *Forum) SaveTopic(topic *Topic, filename string) error {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("cannot read edited content at %s: %v", filename, err)
+	}
+
+	logf("Saving topic %s ...", topic)
+
+	// Discourse drops spaces, so if we don't do this here the value of post.Raw
+	// at the end of the function gets out of sync with what's stored server side.
+	raw := string(bytes.TrimSpace(content))
+
+	body := map[string]interface{}{
 		"post": map[string]interface{}{
-			"raw": string(content),
-			"raw_old": topic.Post.Raw,
+			"raw":     raw,
+			"raw_old": topic.OriginalText(),
 		},
-	})
-	body := bytes.NewReader(data)
-	req, err := http.NewRequest("PUT", f.baseURL+"/posts/"+strconv.Itoa(topic.Post.ID)+".json", body)
+	}
+
+	var result struct {
+		Post *Post `json:"post"`
+	}
+	err = f.do("PUT", "/posts/"+strconv.Itoa(topic.Post.ID)+".json", body, &result)
+	if err != nil {
+		return err
+	}
+
+	logf("Saved %s.", topic)
+
+	topic.Post = result.Post
+	topic.Post.Raw = raw
+	topic.Draft = nil
+	topic.DraftSequence = topic.Post.DraftSequence
+
+	return nil
+}
+
+func (f *Forum) LoadDraft(topic *Topic) error {
+
+	logf("Loading draft for topic %d...", topic.ID)
+
+	var result struct {
+		Data     *DraftData `json:"draft"`
+		Sequence int        `json:"draft_sequence"`
+	}
+	key := "topic_" + strconv.Itoa(topic.ID)
+	err := f.do("GET", "/draft.json?draft_key="+key, nil, &result)
+	if err != nil {
+		return err
+	}
+
+	topic.DraftSequence = result.Sequence
+	if result.Data != nil {
+		topic.Draft = &Draft{
+			Key:      key,
+			Sequence: result.Sequence,
+			TopicID:  topic.ID,
+			Data:     result.Data,
+		}
+	}
+	return nil
+}
+
+func (f *Forum) SaveDraft(topic *Topic, filename string) error {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("cannot read edited content at %s: %v", filename, err)
+	}
+
+	logf("Saving draft for %s ...", topic)
+
+	draft := &Draft{
+		Key:      fmt.Sprintf("topic_%d", topic.ID),
+		TopicID:  topic.ID,
+		Sequence: topic.DraftSequence,
+		Data: &DraftData{
+			Reply:        string(content),
+			Action:       "edit",
+			Title:        topic.Title,
+			ComposerTime: 4321,
+			TypingTime:   1234,
+			PostID:       topic.Post.ID,
+			OriginalText: topic.OriginalText(),
+			Whisper:      false, // What's this?
+		},
+	}
+
+	var result struct {
+		Success       string `json:"success"`
+		DraftSequence int    `json:"draft_sequence"`
+		ConflictUser  struct {
+			ID             int    `json:"id"`
+			Username       string `json:"username"`
+			Name           string `json:"name"`
+			AvatarTemplate string `json:"avatar_template"`
+		} `json:"conflict_user"`
+	}
+
+	err = f.do("POST", "/draft.json", draft, &result)
+	if err != nil {
+		return err
+	}
+
+	var msg = result.Success
+	if msg != "OK" {
+		if msg == "" {
+			msg = "unknown error"
+		}
+		return fmt.Errorf("cannot update draft: %q", msg)
+	}
+
+	topic.Draft = draft
+	topic.DraftSequence = result.DraftSequence
+
+	logf("Saved draft for %s.", topic)
+	return nil
+
+}
+
+func (f *Forum) do(verb, path string, body, result interface{}) error {
+	var rbody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("internal error: cannot marshal request body: %v", err)
+		}
+		rbody = bytes.NewReader(data)
+		debugf("%s on %s with %s", verb, path, data)
+	} else {
+		debugf("%s on %s", verb, path)
+	}
+	req, err := http.NewRequest(verb, f.baseURL+path, rbody)
 	if err != nil {
 		return fmt.Errorf("cannot create request: %v", err)
 	}
@@ -316,195 +608,73 @@ func (f *Forum) UpdateTopic(topic *Topic, source *os.File) error {
 	req.Header.Add("API-Key", f.config.Key)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("cannot perform update: %v", err)
+		return fmt.Errorf("cannot perform request on %s: %v", path, err)
 	}
 	defer resp.Body.Close()
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("cannot read response (status %d): %v", resp.StatusCode, err)
+	}
+
+	debugf("Got response %d with %s", resp.StatusCode, data)
 
 	switch resp.StatusCode {
 	case 200:
 		// ok
 	case 401, 404:
-		return fmt.Errorf("topic or post not found")
-
+		return &NotFoundError{fmt.Sprintf("resource not found: %s", path)}
+	case 409:
+		return fmt.Errorf("someone else edited the same content meanwhile")
 	default:
 		msg := fmt.Sprintf("got %v status", resp.StatusCode)
 
-		data, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			msg = fmt.Sprintf("%s and cannot read response: %v", err)
-		} else {
-			var result struct {
-				Errors    []string `json:"errors"`
-				ErrorType string   `json:"error_type"`
-			}
-			err = json.Unmarshal(data, &result)
-			if err == nil && len(result.Errors) > 0 {
-				msg = result.Errors[0]
-			}
+		var result struct {
+			Errors    []string `json:"errors"`
+			ErrorType string   `json:"error_type"`
 		}
-
-		return fmt.Errorf("cannot perform update: %s", msg)
+		err = json.Unmarshal(data, &result)
+		if err == nil && len(result.Errors) > 0 {
+			msg = result.Errors[0]
+		} else {
+			msg = fmt.Sprintf("got %d status", resp.StatusCode)
+		}
+		return fmt.Errorf("cannot perform request: %s", msg)
 	}
 
-	log.Printf("Update of %s successful.", topic)
-
-	f.ResetCache(topic)
-
+	if result != nil {
+		err = json.Unmarshal(data, result)
+		if err != nil {
+			return fmt.Errorf("cannot decode response from %s: %v", path, err)
+		}
+	}
 	return nil
 
 }
 
-func (f *Forum) Topic(topicID int) (topic *Topic, err error) {
-	now := time.Now()
-	f.mu.Lock()
-	if f.cache == nil {
-		f.cache = make(map[int]*topicCache)
-	}
-	cache, ok := f.cache[topicID]
-	if !ok {
-		cache = &topicCache{}
-		f.cache[topicID] = cache
-	}
-	f.mu.Unlock()
-
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-
-	if cache.time.Add(topicCacheTimeout).After(now) {
-		return cache.topic, nil
-	}
-
-	defer func() {
-		if err != nil {
-			if cache.topic != nil && cache.time.Add(topicCacheFallback).After(now) {
-				topic = cache.topic
-				err = nil
-			} else {
-				f.mu.Lock()
-				delete(f.cache, topicID)
-				f.mu.Unlock()
-			}
-		}
-	}()
-
-	log.Printf("Fetching topic %d...", topicID)
-
-	req, err := http.NewRequest("GET", f.baseURL+"/t/"+strconv.Itoa(topicID)+".json?include_raw=true", nil)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create request: %v", err)
-	}
-	req.Header.Add("API-Username", f.config.Username)
-	req.Header.Add("API-Key", f.config.Key)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("cannot obtain topic: %v", err)
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case 200:
-		// ok
-	case 401, 404:
-		return nil, fmt.Errorf("topic not found")
-
-	default:
-		return nil, fmt.Errorf("cannot obtain topic: got %v status", resp.StatusCode)
-	}
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read topic: %v", err)
-	}
-
-	var result struct {
-		*Topic
-		PostStream struct {
-			Posts []*Post
-		} `json:"post_stream"`
-	}
-	err = json.Unmarshal(data, &result)
-	if err != nil {
-		return nil, fmt.Errorf("cannot unmarshal topic: %v", err)
-	}
-
-	if result.Topic == nil || len(result.PostStream.Posts) == 0 {
-		return nil, fmt.Errorf("internal error: topic has no posts!?", err)
-	}
-
-	result.Topic.Post = result.PostStream.Posts[0]
-
-	cache.topic = result.Topic
-	cache.time = time.Now()
-
-	return result.Topic, nil
+type NotFoundError struct {
+	Message string
 }
 
-func (f *Forum) Search(query string) ([]*Topic, error) {
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return nil, nil
-	}
+func (e *NotFoundError) Error() string {
+	return e.Message
+}
 
-	log.Printf("Fetching search results for: %s", query)
+func isNotFound(err error) bool {
+	_, ok := err.(*NotFoundError)
+	return ok
+}
 
-	q := url.Values{
-		"include_raw": []string{"true"},
-		"q":           []string{"#doc @wiki " + query},
-	}.Encode()
+var quietMode = false
 
-	resp, err := httpClient.Get(f.baseURL + "/search.json?" + q)
-	if err != nil {
-		return nil, fmt.Errorf("cannot obtain search results: %v", err)
+func logf(format string, args ...interface{}) {
+	if !quietMode {
+		log.Printf(format, args...)
 	}
-	defer resp.Body.Close()
+}
 
-	switch resp.StatusCode {
-	case 200:
-		// ok
-	default:
-		return nil, fmt.Errorf("cannot obtain search results: got %v status", resp.StatusCode)
+func debugf(format string, args ...interface{}) {
+	if *debug {
+		log.Printf("[DEBUG] "+format, args...)
 	}
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read search results: %v", err)
-	}
-
-	var result struct {
-		Posts  []*Post
-		Topics []*Topic
-	}
-	err = json.Unmarshal(data, &result)
-	if err != nil {
-		return nil, fmt.Errorf("cannot unmarshal search results: %v", err)
-	}
-
-	topicID := make(map[int]*Topic, len(result.Topics))
-	for _, topic := range result.Topics {
-		topicID[topic.ID] = topic
-	}
-
-	var topics []*Topic
-	for _, post := range result.Posts {
-		if topic, ok := topicID[post.TopicID]; ok { // && topic.ID != indexPageID {
-			topic.Post = post
-			topics = append(topics, topic)
-		}
-	}
-
-	// Take the chance we have the content at hand and replace all cached posts.
-	now := time.Now()
-	f.mu.Lock()
-	if f.cache == nil {
-		f.cache = make(map[int]*topicCache)
-	}
-	for _, topic := range topics {
-		f.cache[topic.ID] = &topicCache{
-			topic: topic,
-			time:  now,
-		}
-	}
-	f.mu.Unlock()
-
-	return topics, nil
 }
