@@ -273,14 +273,13 @@ func edit(forum *Forum, topic *Topic) (filename string, err error) {
 
 	quietMode = true
 	err = cmd.Run()
+	close(stop)
+	<-done
 	quietMode = false
+
 	if err != nil {
 		return filename, fmt.Errorf("cannot edit file %s: %v", filename, err)
 	}
-
-	close(stop)
-	<-done
-
 	return filename, nil
 }
 
