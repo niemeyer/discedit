@@ -47,42 +47,49 @@ func main() {
 	}
 }
 
-var forumsConfigErr = fmt.Errorf("~/.discedit must contain forums in the YAML format:\n" +
-	"forums:\n" +
-	"    https://some.discourse.domain:\n" +
-	"        username: your-username\n" +
-	"        key: your-key\n")
+var configPath = "$HOME/.discedit"
+var configErr error
+
+func init() {
+	configPath = os.ExpandEnv(configPath)
+
+	configErr = fmt.Errorf("%s must contain forums in the YAML format:\n" +
+		"forums:\n" +
+		"    https://some.discourse.domain:\n" +
+		"        username: your-username\n" +
+		"        key: your-key\n", configPath)
+}
 
 func readConfig() (*Config, error) {
 	var config Config
 
-	data, err := ioutil.ReadFile(os.ExpandEnv("$HOME/.discedit"))
+	data, err := ioutil.ReadFile(configPath)
 	if os.IsNotExist(err) {
-		return nil, forumsConfigErr
+		return nil, configErr
 	}
 	if err != nil {
-		return nil, fmt.Errorf("cannot read ~/.discedit: %v", err)
+		return nil, fmt.Errorf("cannot read %s: %v", configPath, err)
 	}
 	err = yaml.Unmarshal(data, &config)
 	if err != nil {
-		return nil, fmt.Errorf("cannot unmarshal ~/.discedit: %v", err)
+		return nil, fmt.Errorf("cannot unmarshal %s: %v", configPath, err)
 	}
 	if len(config.Forums) == 0 {
-		return nil, forumsConfigErr
+		return nil, configErr
 	}
 
 	for baseURL, fconfig := range config.Forums {
 		cleanURL := strings.TrimRight(baseURL, "/")
 		_, _, err = parseTopicURL(cleanURL + "/t/123")
 		if err != nil {
-			return nil, fmt.Errorf("~/.discedit has invalid forum URL: %q", baseURL)
+			return nil, fmt.Errorf("%s has invalid forum URL: %q", configPath, baseURL)
 		}
 		if cleanURL != baseURL {
 			config.Forums[cleanURL] = fconfig
 			delete(config.Forums, baseURL)
 		}
 		if fconfig.Username == "" || fconfig.Key == "" {
-			return nil, fmt.Errorf("~/.discedit misses username or key for forum %s", baseURL)
+			return nil, fmt.Errorf("%s misses username or key for forum %s", configPath, baseURL)
 		}
 	}
 	return &config, nil
@@ -110,7 +117,7 @@ func run() error {
 
 	fconfig := config.Forums[baseURL]
 	if fconfig == nil {
-		return fmt.Errorf("~/.discedit misses username and key for forum %s", baseURL)
+		return fmt.Errorf("%s misses username and key for forum %s", configPath, baseURL)
 	}
 
 	forum := &Forum{
@@ -148,7 +155,7 @@ func run() error {
 		// made may have been previously saved via live editing.
 		different, empty, err = fileChanged(filename, topic.OriginalText())
 	}
-	if (different && !empty) || err != nil {
+	if filename != "" && different && !empty {
 		defer renameToLast(filename)
 	}
 	if err != nil {
@@ -177,11 +184,11 @@ func run() error {
 }
 
 func renameToLast(filename string) {
-	renameErr := os.Rename(filename, os.ExpandEnv("$HOME/.discedit.last.md"))
+	renameErr := os.Rename(filename, configPath + ".last.md")
 	if renameErr != nil {
 		logf("WARNING: Cannot save backup: %v", renameErr)
 	} else {
-		logf("Saved backup: ~/.discedit.last.md")
+		logf("Saved backup: " + configPath + ".last.md")
 	}
 }
 
@@ -195,7 +202,7 @@ func edit(forum *Forum, topic *Topic) (filename string, err error) {
 
 	text := topic.EditText()
 
-	tmpfile, err := os.Create(fmt.Sprintf("%s/.discedit.%d.md", os.Getenv("HOME"), os.Getpid()))
+	tmpfile, err := os.Create(configPath + "." + strconv.Itoa(os.Getpid()) + ".md")
 	if err == nil {
 		_, err = tmpfile.Write([]byte(text))
 	}
@@ -218,7 +225,7 @@ func edit(forum *Forum, topic *Topic) (filename string, err error) {
 
 	stat, err := os.Stat(filename)
 	if err != nil {
-		return "", fmt.Errorf("cannot stat temporary file: %v", err)
+		return filename, fmt.Errorf("cannot stat temporary file: %v", err)
 	}
 	stop := make(chan bool)
 	done := make(chan bool)
@@ -268,7 +275,7 @@ func edit(forum *Forum, topic *Topic) (filename string, err error) {
 	err = cmd.Run()
 	quietMode = false
 	if err != nil {
-		return "", fmt.Errorf("cannot edit file %s: %v", filename, err)
+		return filename, fmt.Errorf("cannot edit file %s: %v", filename, err)
 	}
 
 	close(stop)
