@@ -4,14 +4,18 @@ The discedit tool allows you to edit [Discourse](https://www.discourse.org/) top
 ## Setting up
 You will need to install [Go](https://golang.org/doc/install) and have a Discourse API key. The key should be personal (set to a single user) and the scope should be set to global (allows all actions). If you don't have the rights to handle keys, get in touch with the administrator of your Discourse installation.
 
-1. Clone this repository and navigate into the directory:
+**1. Clone this repository and navigate into the directory:**
+```
+git clone https://github.com/niemeyer/discedit.git
+cd discedit
+```
 
-`git clone https://github.com/niemeyer/discedit.git`
+**2. Compile the application:**
+```
+go build
+```
 
-`cd discedit`
-
-2. Compile the application:
-
-`go build`
-
-3. Run `./discedit <topic URL>` and follow the tool instructions to complete your setup.
+**3. Run and follow the tool instructions to complete your setup.**
+```
+./discedit <topic URL>
+```
