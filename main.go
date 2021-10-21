@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/niemeyer/discedit/shlex"
 )
 
 var (
@@ -193,9 +195,13 @@ func renameToLast(filename string) {
 }
 
 func edit(forum *Forum, topic *Topic) (filename string, err error) {
-	editor := os.Getenv("EDITOR")
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
 	if editor == "" {
 		editor = "sensible-editor"
+	}
+	args, err := shlex.Split(editor)
+	if err != nil {
+		return "", fmt.Errorf("cannot parse editor command: %v", err)
 	}
 
 	logf("Opening your preferred editor...")
@@ -218,7 +224,9 @@ func edit(forum *Forum, topic *Topic) (filename string, err error) {
 	}
 	filename = tmpfile.Name()
 
-	cmd := exec.Command(editor, filename)
+	args = append(args, filename)
+
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
