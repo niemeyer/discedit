@@ -1,0 +1,34 @@
+name: discedit
+base: core22
+version: git
+summary: Command line editor for Discourse
+description: |
+  The discedit tool allows you to edit Discourse topics in your favourite local
+  text editor. It works by pulling a topic from Discourse, opening it in a
+  local text editor and automatically pushing the edits.
+grade: devel
+confinement: strict
+
+environment:
+  EDITOR: vim.basic
+
+layout:
+  /usr/share/vim:
+    bind: $SNAP/usr/share/vim
+
+apps:
+  discedit:
+    command: bin/discedit
+    plugs:
+      - home
+      - network
+
+parts:
+  discedit:
+    plugin: go
+    source: https://github.com/niemeyer/discedit.git
+    source-type: git
+    build-snaps:
+      - go
+    stage-packages:
+      - vim
