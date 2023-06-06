@@ -57,14 +57,6 @@ The topic will pull down the topic as a file, and open it in your system's prefe
 
 ## Refinements
 
-### Add an alias
-
-It's more convenient to be able to run discedit from anywhere, not just the `discedit` repository; add an alias, for example:
-
-```
-alias discedit="~/Repositories/discedit/discedit"
-```
-
 ### Use live edit mode
 
 The `-live-edit` option will push your changes to Discourse on save, not just on closing the file (this can also be included in any alias you set up):
@@ -81,6 +73,12 @@ For Linux: `discedit '$(xclip -o -selection -c)'`
 
 For macOS: `discedit '$(pbpaste)'`
 
+### Add an alias
+
+It's more convenient to be able to run discedit from anywhere, not just the `discedit` repository. It's also more convenient to set your preferred command line options. Add an alias, for example:
+
+For Linux: `alias discedit='~/Repositories/discedit/discedit -live-edit $(xclip -o -selection -c)'`
+For macOS: `alias discedit='~/Repositories/discedit/discedit -live-edit $(pbpaste)'`
 
 ## Reference
 
